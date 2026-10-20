@@ -68,7 +68,7 @@ impl ControlContext {
     /// Snapshots the daemon state.
     fn status(&self) -> Status {
         let state = self.store.snapshot();
-        let peers = self.peers.statuses();
+        let peers = self.peers.statuses(&state);
         // Peer-related entries are resolved to (and filtered by) the
         // paired name: hub state recorded for a since-unpaired peer can no
         // longer be acted on, and the endpoint is not ours to show.
@@ -104,6 +104,7 @@ impl ControlContext {
 
         Status {
             name: state.machine.name,
+            server: state.machine.server,
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().unwrap_or_default().as_secs(),
             jj_version: self.jj_version.clone(),
@@ -216,9 +217,10 @@ async fn handle_client(
         Err(_) => return,
     };
 
-    // PairJoin, CloneRepo and Logs own their stream (client-cancel
-    // handling, and streaming for the clone and logs); the rest return a
-    // single response and share one error conversion.
+    // PairJoin, CloneRepo, Logs and HoldWorkspace own their stream
+    // (client-cancel handling, streaming for the clone and logs, and the
+    // hold lasting as long as the connection); the rest return a single
+    // response and share one error conversion.
     let served = match request {
         Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
         Request::PairHost => reply(&mut stream, pair_host(&ctx).await).await,
@@ -234,6 +236,10 @@ async fn handle_client(
         Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
         Request::RenameMachine { name } => reply(&mut stream, rename_machine(&ctx, &name)).await,
         Request::Logs { follow } => stream_logs(&mut stream, &ctx, follow).await,
+        Request::SetServer { enabled } => reply(&mut stream, set_server(&ctx, enabled)).await,
+        Request::HoldWorkspace { repo, workspace } => {
+            hold_workspace(&mut stream, &ctx, &repo, &workspace).await
+        }
     };
 
     if let Err(err) = served {
@@ -313,10 +319,13 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
 /// daemon is the authority, and registering an invalid path would only
 /// surface later as a watch failure. Storing the discovered main workspace
 /// root (canonicalized) also keeps two spellings of one repo, or two of its
-/// workspaces, from registering twice.
+/// workspaces, from registering twice. Its git object hash goes to the mesh
+/// record, so clones and replicas use the same.
 async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
-    let root = crate::spawn_blocking(move || -> Result<PathBuf> {
-        Ok(JjRepo::discover(&path)?.root().to_owned())
+    let (root, object_hash) = crate::spawn_blocking(move || -> Result<_> {
+        let repo = JjRepo::discover(&path)?;
+        let object_hash = repo.open()?.object_hash()?;
+        Ok((repo.root().to_owned(), object_hash))
     })
     .await
     .wrap_err("repo validation task failed")??;
@@ -327,7 +336,9 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
             Repo {
                 id: RepoId::generate(),
                 path: root,
+                bare: false,
             },
+            object_hash,
         )
     })?;
     Ok(Response::RepoAdded)
@@ -364,6 +375,30 @@ fn rename_machine(ctx: &ControlContext, name: &str) -> Result<Response> {
         .update(|state| state.rename_machine(name.to_owned()))?;
     info!(machine = %name, "machine renamed");
     Ok(Response::MachineRenamed)
+}
+
+/// Switches server mode; the store gossips the role.
+fn set_server(ctx: &ControlContext, enabled: bool) -> Result<Response> {
+    ctx.store.update(|state| state.set_server(enabled))?;
+    info!(enabled, "server mode switched");
+    Ok(Response::ServerSet)
+}
+
+/// Holds back the workspace task of `workspace` in `repo` until the client
+/// disconnects, which also covers a creator that crashed.
+async fn hold_workspace(
+    stream: &mut UnixStream,
+    ctx: &ControlContext,
+    repo: &str,
+    workspace: &str,
+) -> Result<()> {
+    let _hold = match ctx.repos.hold(repo, workspace) {
+        Ok(hold) => hold,
+        Err(err) => return reply(stream, Err(err)).await,
+    };
+    respond(stream, &Response::WorkspaceHeld).await?;
+    client_gone(stream).await;
+    Ok(())
 }
 
 /// Streams the buffered daemon events, then the new ones when following,

@@ -10,7 +10,9 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    daemon::repos::WorkspaceState, net::sync::StatusReport, repo::transfer::TransferProgress,
+    daemon::repos::WorkspaceState,
+    net::{hello::Incompatible, sync::StatusReport},
+    repo::transfer::TransferProgress,
 };
 
 /// Maximum accepted size of a control message.
@@ -26,11 +28,6 @@ pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
 /// CLI tells the user; the daemon enforces it.
 pub const PAIR_TICKET_TTL: Duration = Duration::from_mins(3);
 
-/// Deadline for the network-facing work of a clone's initial repo pull
-/// (it may transfer an entire repository); the pull's local apply and
-/// index work runs unbounded.
-pub(super) const CLONE_PULL_NET_TIMEOUT: Duration = Duration::from_mins(30);
-
 /// Cadence at which the daemon re-sends the latest clone progress. Sent
 /// unconditionally, changed or not: the frames double as the liveness
 /// signal behind [`CLONE_IDLE_WAIT`].
@@ -39,8 +36,7 @@ pub(super) const CLONE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Time budget the CLI grants between clone frames, not the whole exchange:
 /// the daemon heartbeats progress every [`CLONE_PROGRESS_INTERVAL`] while
 /// the clone runs, so a silent daemon is a dead one. The transfer's
-/// network phases stay bounded by the daemon's own
-/// [`CLONE_PULL_NET_TIMEOUT`].
+/// network phases stay bounded by the daemon's own pull deadline.
 pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.
@@ -91,6 +87,16 @@ pub enum Request {
     /// entry. With `follow`, new entries (or [`Response::LogsSkipped`])
     /// keep coming until the client disconnects.
     Logs { follow: bool },
+    /// Switch server mode on this machine; peers learn the role through
+    /// the gossip. Answered with [`Response::ServerSet`] or
+    /// [`Response::Error`].
+    SetServer { enabled: bool },
+    /// Hold back the daemon from keeping the workspace named `workspace`
+    /// of the registered repo `repo` fresh, so the CLI can create it and
+    /// write its settings first. Answered with [`Response::WorkspaceHeld`]
+    /// or [`Response::Error`]; the hold lasts until the client
+    /// disconnects.
+    HoldWorkspace { repo: String, workspace: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -142,6 +148,10 @@ pub enum Response {
     /// This many events were skipped in a followed [`Request::Logs`]
     /// stream: the client read too slowly.
     LogsSkipped(u64),
+    /// Server mode is switched in the mesh state.
+    ServerSet,
+    /// The workspace is held until the client disconnects.
+    WorkspaceHeld,
 }
 
 /// Header of a [`Request::Logs`] stream.
@@ -196,6 +206,8 @@ pub struct CloneProgress {
 pub struct Status {
     /// This machine's name in the mesh.
     pub name: String,
+    /// Whether this machine runs in server mode.
+    pub server: bool,
     /// This machine's endpoint id.
     pub endpoint: EndpointId,
     /// Seconds since the daemon started.
@@ -240,6 +252,8 @@ pub struct ConflictStatus {
 pub struct PeerStatus {
     pub name: String,
     pub endpoint: EndpointId,
+    /// Whether the peer runs in server mode.
+    pub server: bool,
     pub connection: ConnectionStatus,
 }
 
@@ -264,6 +278,14 @@ pub enum ConnectionStatus {
         retry_in_secs: u64,
         /// Why the last attempt failed.
         error: String,
+    },
+    /// The peer speaks another protocol version; redialed in case it
+    /// updates.
+    Incompatible {
+        /// The peer's hello.
+        peer: Incompatible,
+        /// Seconds until the next attempt.
+        retry_in_secs: u64,
     },
 }
 

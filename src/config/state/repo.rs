@@ -12,8 +12,12 @@ pub struct Repo {
     /// Mesh-wide identifier of the repo.
     pub id: RepoId,
     /// Local repository root (the directory containing `.jj`), stored
-    /// canonicalized by `MeshState::add_repo`.
+    /// canonicalized on registration.
     pub path: PathBuf,
+    /// Whether it is a bare replica made by server mode, in
+    /// [`crate::config::ConfigDir::replicas_dir`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bare: bool,
 }
 
 /// Mesh-wide identifier of a repo, shared by all machines syncing it.
@@ -57,6 +61,49 @@ impl TryFrom<String> for RepoId {
 impl fmt::Display for RepoId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The git object hash of a repo, fixed at its creation: every copy of a
+/// mesh repo must use the same, or their commit ids differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectHash {
+    /// jj's default, and what records predating the field held.
+    #[default]
+    Sha1,
+    Sha256,
+}
+
+impl ObjectHash {
+    /// The gix hash kind.
+    pub fn kind(self) -> gix::hash::Kind {
+        match self {
+            ObjectHash::Sha1 => gix::hash::Kind::Sha1,
+            ObjectHash::Sha256 => gix::hash::Kind::Sha256,
+        }
+    }
+}
+
+impl TryFrom<gix::hash::Kind> for ObjectHash {
+    type Error = String;
+
+    fn try_from(kind: gix::hash::Kind) -> Result<Self, Self::Error> {
+        match kind {
+            gix::hash::Kind::Sha1 => Ok(ObjectHash::Sha1),
+            gix::hash::Kind::Sha256 => Ok(ObjectHash::Sha256),
+            kind => Err(format!("unsupported git object hash {kind}")),
+        }
+    }
+}
+
+/// The name jj's `--object-hash` takes.
+impl fmt::Display for ObjectHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ObjectHash::Sha1 => "sha1",
+            ObjectHash::Sha256 => "sha256",
+        })
     }
 }
 

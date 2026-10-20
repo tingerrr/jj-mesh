@@ -25,19 +25,22 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use self::{
-    claims::MAX_OTHER_WORKSPACES,
-    membership::{
-        MAX_OTHER_PEERS, MAX_RECORD_VERSION, Register as _, bumped_version, should_adopt,
-    },
-};
 pub use self::{
-    claims::{MAX_MACHINE_WORKSPACES, MAX_MESH_WORKSPACES, RepoClaims, WorkspaceClaims},
+    claims::{
+        MAX_MACHINE_WORKSPACES, MAX_MESH_CLAIMED_REPOS, MAX_MESH_WORKSPACES, RepoClaims,
+        WorkspaceClaims,
+    },
     machine::Machine,
     membership::{
         MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, MeshRepo, MeshRepoStatus, Peer, PeerStatus,
     },
-    repo::{Repo, RepoId},
+    repo::{ObjectHash, Repo, RepoId},
+};
+use self::{
+    claims::{MAX_OTHER_REPOS, MAX_OTHER_WORKSPACES},
+    membership::{
+        MAX_OTHER_PEERS, MAX_RECORD_VERSION, Register as _, bumped_version, should_adopt,
+    },
 };
 use super::{ConfigDir, validate_name};
 
@@ -146,6 +149,34 @@ impl MeshState {
         }
     }
 
+    /// Corrects the object hash the mesh records for a registered repo, as
+    /// its stores report it; the bumped version propagates the fix.
+    /// Records written before the hash was gossiped read as SHA-1.
+    pub fn set_object_hash(&mut self, id: &RepoId, object_hash: ObjectHash) -> Result<()> {
+        let Some(name) = self.repo_name(id).map(str::to_owned) else {
+            return Ok(());
+        };
+        let stale = matches!(
+            self.mesh_repos.get(&name).and_then(MeshRepo::present),
+            Some((mesh_id, recorded)) if mesh_id == id && recorded != object_hash
+        );
+        if !stale {
+            return Ok(());
+        }
+        let version = bumped_version(&self.mesh_repos, &name)?;
+        self.mesh_repos.insert(
+            name,
+            MeshRepo {
+                version,
+                status: MeshRepoStatus::Present {
+                    id: id.clone(),
+                    object_hash,
+                },
+            },
+        );
+        Ok(())
+    }
+
     /// Sets the workspaces of a registered repo this machine claims. A repo
     /// unregistered meanwhile is left unclaimed.
     pub fn set_claims(&mut self, id: &RepoId, names: BTreeSet<String>) -> Result<()> {
@@ -237,7 +268,10 @@ impl MeshState {
             endpoint,
             Peer {
                 version,
-                status: PeerStatus::Alive { name },
+                status: PeerStatus::Alive {
+                    name,
+                    server: false,
+                },
             },
         );
 
@@ -248,6 +282,12 @@ impl MeshState {
     /// through the gossip.
     pub fn rename_machine(&mut self, name: String) -> Result<()> {
         self.machine.rename(name)
+    }
+
+    /// Switches server mode on this machine; the bumped version propagates
+    /// the role through the gossip.
+    pub fn set_server(&mut self, server: bool) -> Result<()> {
+        self.machine.set_server(server)
     }
 
     /// Tombstones an alive peer, resolved by name or full endpoint id.
@@ -293,17 +333,14 @@ impl MeshState {
         Ok(endpoint)
     }
 
-    /// Adds a repo, rejecting duplicate names, paths and ids, and records
-    /// it in the mesh-wide repo list, superseding any tombstone. The path
-    /// is stored canonicalized, whatever the caller sent, so path
-    /// comparisons never have to resolve stored entries again.
-    pub fn add_repo(&mut self, name: String, mut repo: Repo) -> Result<()> {
-        repo.path = canonical_path(&repo.path);
-        self.validate_new_repo(&name, &repo.path)?;
+    /// Adds a repo using `object_hash`, rejecting duplicate names, paths
+    /// and ids, and records it in the mesh-wide repo list, superseding any
+    /// tombstone. The path is stored canonicalized, whatever the caller
+    /// sent, so path comparisons never have to resolve stored entries
+    /// again.
+    pub fn add_repo(&mut self, name: String, repo: Repo, object_hash: ObjectHash) -> Result<()> {
+        let repo = self.check_new_repo(&name, repo)?;
         self.ensure_mesh_id(&name, &repo.id)?;
-        if let Some(existing) = self.repo_name(&repo.id) {
-            bail!("repo {} is already registered as `{existing}`", repo.id);
-        }
         ensure!(
             self.mesh_repos.contains_key(&name) || self.mesh_repos.len() < MAX_MESH_REPOS,
             "the mesh already has {MAX_MESH_REPOS} repos",
@@ -316,6 +353,7 @@ impl MeshState {
                 version,
                 status: MeshRepoStatus::Present {
                     id: repo.id.clone(),
+                    object_hash,
                 },
             },
         );
@@ -324,9 +362,35 @@ impl MeshState {
         Ok(())
     }
 
+    /// Registers a clone of the mesh repo `name`, which the mesh must still
+    /// list under the repo's id. Unlike [`Self::add_repo`], the mesh record
+    /// is left alone: a clone finishing after a removal must not undo it.
+    pub fn add_clone(&mut self, name: String, repo: Repo) -> Result<()> {
+        let repo = self.check_new_repo(&name, repo)?;
+        ensure!(
+            self.mesh_repo_id(&name) == Some(&repo.id),
+            "`{name}` is no longer in the mesh",
+        );
+        self.repos.insert(name, repo);
+
+        Ok(())
+    }
+
+    /// Checks that `repo` can be registered under `name`, canonicalizing
+    /// its path.
+    fn check_new_repo(&self, name: &str, mut repo: Repo) -> Result<Repo> {
+        repo.path = canonical_path(&repo.path);
+        self.validate_new_repo(name, &repo.path)?;
+        if let Some(existing) = self.repo_name(&repo.id) {
+            bail!("repo {} is already registered as `{existing}`", repo.id);
+        }
+        Ok(repo)
+    }
+
     /// Retires a repo name from the mesh: tombstones the mesh record and
     /// unregisters the repo here. The tombstone propagates the removal, so
-    /// every machine stops syncing the repo; none of them touch its files.
+    /// every machine stops syncing the repo; only servers delete their
+    /// replica, unless a workspace uses it.
     /// Returns whether the repo was registered on this machine.
     pub fn remove_repo(&mut self, name: &str) -> Result<bool> {
         match (self.mesh_repos.get(name), self.repos.contains_key(name)) {
@@ -353,10 +417,26 @@ impl MeshState {
     /// mesh record is untouched: the other machines keep syncing the repo
     /// among themselves, and it stays clonable here (that is also the only
     /// way back in, since re-adding it would fork the name).
+    ///
+    /// Bare replicas cannot be forgotten: server mode would replicate them
+    /// again.
     pub fn forget_repo(&mut self, name: &str) -> Result<Repo> {
-        match self.unregister_repo(name) {
-            Some(repo) => Ok(repo),
+        match self.repos.get(name) {
             None => bail!("no repo named `{name}` is registered on this machine"),
+            Some(repo) if repo.bare => {
+                bail!(
+                    "`{name}` is a server replica; disable server mode or remove it from the mesh"
+                )
+            }
+            Some(_) => Ok(self.unregister_repo(name).expect("registered")),
+        }
+    }
+
+    /// Unregisters a bare replica (server mode is off and no workspace uses
+    /// it); other repos are left alone.
+    pub fn drop_replica(&mut self, name: &str) {
+        if self.repos.get(name).is_some_and(|repo| repo.bare) {
+            self.unregister_repo(name);
         }
     }
 
@@ -420,7 +500,7 @@ impl MeshState {
                 self.machine.observe(record);
                 continue;
             }
-            if let PeerStatus::Alive { name } = &record.status
+            if let PeerStatus::Alive { name, .. } = &record.status
                 && validate_name("peer", name).is_err()
             {
                 continue;
@@ -455,9 +535,9 @@ impl MeshState {
     }
 
     /// Merges the gossiped workspace claims: only alive peers' are kept,
-    /// and new or grown records stop being adopted at the cap.
+    /// and new or grown records stop being adopted at the caps.
     fn merge_claims(&mut self, remote: &Membership, local: &EndpointId) {
-        let mut others: usize = self.peer_claims.values().map(WorkspaceClaims::count).sum();
+        let (mut names, mut repos) = WorkspaceClaims::tally(self.peer_claims.values());
         for (endpoint, record) in &remote.claims {
             if record.version >= MAX_RECORD_VERSION {
                 continue;
@@ -473,11 +553,14 @@ impl MeshState {
             {
                 continue;
             }
-            let adopted = others - held.map_or(0, WorkspaceClaims::count) + record.count();
-            if adopted > MAX_OTHER_WORKSPACES {
+            let (held_names, held_repos) = WorkspaceClaims::tally(held);
+            let (record_names, record_repos) = WorkspaceClaims::tally([record]);
+            let adopted_names = names - held_names + record_names;
+            let adopted_repos = repos - held_repos + record_repos;
+            if adopted_names > MAX_OTHER_WORKSPACES || adopted_repos > MAX_OTHER_REPOS {
                 continue;
             }
-            others = adopted;
+            (names, repos) = (adopted_names, adopted_repos);
             self.peer_claims.insert(*endpoint, record.clone());
         }
         self.prune_claims();
@@ -508,6 +591,7 @@ mod tests {
         fn new(name: &str, version: u64) -> Self {
             Machine {
                 name: name.to_owned(),
+                server: false,
                 version,
             }
         }
@@ -517,7 +601,10 @@ mod tests {
     fn present(version: u64, id: &RepoId) -> MeshRepo {
         MeshRepo {
             version,
-            status: MeshRepoStatus::Present { id: id.clone() },
+            status: MeshRepoStatus::Present {
+                id: id.clone(),
+                object_hash: ObjectHash::Sha1,
+            },
         }
     }
 
@@ -536,7 +623,9 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: tmp.path().join("project"),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
         state.save(&dir).unwrap();
@@ -596,6 +685,7 @@ mod tests {
             version,
             status: PeerStatus::Alive {
                 name: name.to_owned(),
+                server: false,
             },
         };
         let removed = |version| Peer {
@@ -645,6 +735,7 @@ mod tests {
             version,
             status: PeerStatus::Alive {
                 name: name.to_owned(),
+                server: false,
             },
         };
         let about_us = |record: Peer| Membership {
@@ -668,14 +759,23 @@ mod tests {
         assert_eq!(state.machine, Machine::new("desk", 6));
         assert!(alive(6, "desk").outranks(&alive(5, "stale")));
 
+        // ...as is one with another role.
+        state.set_server(true).unwrap();
+        assert_eq!(state.machine.version, 7);
+        state.merge_membership(&about_us(alive(7, "desk")), &local);
+        assert_eq!(state.machine.version, 8);
+        assert!(state.membership(local).peers[&local].is_server());
+        state.set_server(false).unwrap();
+        assert_eq!(state.machine, Machine::new("desk", 9));
+
         // ...and a tombstone is matched, not outranked: the removed machine
         // cannot undo its removal.
         let removed = Peer {
-            version: 8,
+            version: 10,
             status: PeerStatus::Removed,
         };
         state.merge_membership(&about_us(removed.clone()), &local);
-        assert_eq!(state.machine, Machine::new("desk", 8));
+        assert_eq!(state.machine, Machine::new("desk", 10));
         assert!(!state.membership(local).peers[&local].outranks(&removed));
 
         // Records about ourselves never land in the peer map.
@@ -719,6 +819,7 @@ mod tests {
                             version: 1,
                             status: PeerStatus::Alive {
                                 name: "flood".to_owned(),
+                                server: false,
                             },
                         },
                     )
@@ -782,6 +883,37 @@ mod tests {
             // And so does removing it again.
             state.remove_peer("laptop").unwrap();
         }
+    }
+
+    /// Records written before the object hash was gossiped read as SHA-1,
+    /// and the machines holding the repo correct them.
+    #[test]
+    fn object_hash_records_are_corrected() {
+        let id = RepoId::generate();
+        let json = format!(r#"{{"version":3,"status":{{"present":{{"id":"{id}"}}}}}}"#);
+        let record: MeshRepo = serde_json::from_str(&json).unwrap();
+        assert_eq!(record.present(), Some((&id, ObjectHash::Sha1)));
+
+        let mut state = MeshState::default();
+        state.mesh_repos.insert("proj".to_owned(), record.clone());
+        // Only a registered repo is corrected.
+        state.set_object_hash(&id, ObjectHash::Sha256).unwrap();
+        assert_eq!(state.mesh_repos["proj"], record);
+
+        state.repos.insert(
+            "proj".to_owned(),
+            Repo {
+                id: id.clone(),
+                path: "/p".into(),
+                bare: false,
+            },
+        );
+        state.set_object_hash(&id, ObjectHash::Sha256).unwrap();
+        let corrected = state.mesh_repos["proj"].clone();
+        assert_eq!(corrected.present(), Some((&id, ObjectHash::Sha256)));
+        assert!(corrected.outranks(&record));
+        state.set_object_hash(&id, ObjectHash::Sha256).unwrap();
+        assert_eq!(state.mesh_repos["proj"], corrected);
     }
 
     #[test]
@@ -860,7 +992,9 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: "/p".into(),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap_err();
         assert!(err.to_string().contains("clone"), "{err:#}");
@@ -872,10 +1006,13 @@ mod tests {
         let repo = |id: &RepoId| Repo {
             id: id.clone(),
             path: "/p".into(),
+            bare: false,
         };
 
         let first = RepoId::generate();
-        state.add_repo("proj".to_owned(), repo(&first)).unwrap();
+        state
+            .add_repo("proj".to_owned(), repo(&first), ObjectHash::Sha1)
+            .unwrap();
         assert!(state.remove_repo("proj").unwrap(), "it was registered here");
 
         // The name is retired, not deleted: it stays as a tombstone so a
@@ -889,7 +1026,9 @@ mod tests {
 
         // And the name can be reused, superseding the tombstone.
         let second = RepoId::generate();
-        state.add_repo("proj".to_owned(), repo(&second)).unwrap();
+        state
+            .add_repo("proj".to_owned(), repo(&second), ObjectHash::Sha1)
+            .unwrap();
         assert_eq!(state.mesh_repo_id("proj"), Some(&second));
         assert!(state.mesh_repos["proj"].version > 2);
     }
@@ -904,7 +1043,9 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/p".into(),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
 
@@ -924,7 +1065,9 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: repo.path,
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap_err();
         assert!(err.to_string().contains("clone"), "{err:#}");
@@ -942,7 +1085,9 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/p".into(),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
 
@@ -982,7 +1127,9 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: real,
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
 
@@ -1001,7 +1148,9 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/a".into(),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
         assert!(
@@ -1010,8 +1159,10 @@ mod tests {
                     "b".to_owned(),
                     Repo {
                         id,
-                        path: "/b".into()
-                    }
+                        path: "/b".into(),
+                        bare: false,
+                    },
+                    ObjectHash::Sha1
                 )
                 .is_err()
         );
@@ -1077,7 +1228,9 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/tmp/proj".into(),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
         state
@@ -1117,7 +1270,9 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/tmp/proj".into(),
+                    bare: false,
                 },
+                ObjectHash::Sha1,
             )
             .unwrap();
         let names = |n: usize| (0..n).map(|i| format!("w{i}")).collect::<BTreeSet<_>>();

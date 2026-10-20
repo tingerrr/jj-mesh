@@ -23,7 +23,8 @@
 //!   workspaces in its store).
 //!
 //! A claim is released only when its name leaves the view, so a workspace
-//! briefly gone from disk (an unmounted disk) keeps it.
+//! briefly gone from disk (an unmounted disk) keeps it. A held workspace
+//! (see [`RepoSet::hold`]) gets its task once released.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -40,15 +41,16 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::{
-    ClaimUpdate, RepoHandle, RepoSet, RepoState, Settings, WorkspaceState, sleep_until,
+    Holds, RepoHandle, RepoSet, RepoState, RepoUpdate, Settings, WorkspaceState,
     workspace::{RepoContext, WorkspaceHandle, may_be_stale, spawn_workspace},
 };
 use crate::{
-    config::{Repo, RepoClaims, RepoId, validate_name},
+    config::{ObjectHash, Repo, RepoClaims, RepoId, validate_name},
     daemon::{
         backoff::Backoff,
         control::{WorkspacePlace, WorkspaceStatus},
         hub::{Inbox, PeerAnnounce, SyncHub},
+        sleep_until,
     },
     net::fetch::GitTransferFormat,
     repo::{JjRepo, OpenRepo, StoreFingerprint, Workspace, repo_present, transfer},
@@ -82,10 +84,6 @@ const LIVENESS_INTERVAL: Duration = Duration::from_mins(1);
 /// status response.
 const MAX_ERROR_LEN: usize = 256;
 
-/// Cap on head ids accepted in one announcement; legitimate divergence is
-/// a few heads, anything more is a hostile or broken peer.
-const MAX_ANNOUNCED_HEADS: usize = 64;
-
 /// Deadline for the network-facing work of one fetch from a peer: a
 /// stalled or hostile server must not pin the repo task forever
 /// (announcement handling and local change publication pause while a
@@ -109,6 +107,7 @@ pub(super) fn spawn_repo(
     name: String,
     repo: &Repo,
     claims: RepoClaims,
+    recorded_hash: Option<ObjectHash>,
 ) -> RepoHandle {
     let state = Arc::new(Mutex::new(RepoState::Opening));
     let announcements = set.hub.register_repo(name.clone(), repo.id.clone());
@@ -126,7 +125,9 @@ pub(super) fn spawn_repo(
             changed: set.changed.clone(),
             settings: set.settings,
             claims: claims_rx,
-            claim: set.claim.clone(),
+            holds: set.holds.subscribe(),
+            recorded_hash,
+            updates: set.updates.clone(),
         })
         .instrument(span),
     );
@@ -154,7 +155,11 @@ struct RepoTask {
     settings: Option<Settings>,
     /// The claims on the repo's workspaces.
     claims: watch::Receiver<RepoClaims>,
-    claim: mpsc::UnboundedSender<ClaimUpdate>,
+    /// The workspaces of every repo being created.
+    holds: watch::Receiver<Holds>,
+    /// The git object hash the mesh recorded for the repo at spawn.
+    recorded_hash: Option<ObjectHash>,
+    updates: mpsc::UnboundedSender<RepoUpdate>,
 }
 
 /// Opens and watches one repo forever: reopening immediately when the
@@ -222,6 +227,7 @@ impl RepoTask {
         // Fetch serving is dispatched by the hub (see `hub::serve`), never
         // by this loop: a fetch below may block on the very peer being served.
         self.hub.repo_opened(&self.name, &self.id, repo.clone());
+        self.correct_object_hash(&repo);
 
         // Watch before the first read: changes racing the setup produce at
         // worst a no-change wakeup.
@@ -248,6 +254,7 @@ impl RepoTask {
         let ctx = Arc::new(RepoContext::new(repo.clone(), self.settings));
         let (synced, _) = watch::channel(None);
         let mut claims = self.claims.clone();
+        let mut holds = self.holds.clone();
         let mut workspaces = Workspaces::default();
         let current = claims.borrow_and_update().clone();
         self.track_workspaces(&ctx, &heads, &synced, &current, &mut workspaces)
@@ -278,6 +285,7 @@ impl RepoTask {
                 }
                 () = self.announcements.changed() => {}
                 Ok(()) = claims.changed() => rescan = true,
+                Ok(()) = holds.changed() => rescan = true,
                 () = sleep_until(retry_at) => {}
             }
 
@@ -385,7 +393,7 @@ impl RepoTask {
         };
 
         if scan.claimed != claims.ours && workspaces.sent.as_ref() != Some(&scan.claimed) {
-            let _ = self.claim.send(ClaimUpdate {
+            let _ = self.updates.send(RepoUpdate::Claims {
                 repo: self.id.clone(),
                 names: scan.claimed.clone(),
             });
@@ -406,8 +414,17 @@ impl RepoTask {
             keep
         });
         workspaces.listed = scan.listed();
+        // Read after the scan: a workspace it found was created after its
+        // hold was taken.
+        let creating: BTreeSet<String> = self
+            .holds
+            .borrow()
+            .iter()
+            .filter(|(repo, _)| *repo == self.name)
+            .map(|(_, workspace)| workspace.clone())
+            .collect();
         for found in scan.found {
-            if !automated(&found) {
+            if !automated(&found) || creating.contains(&found.name) {
                 continue;
             }
             let root = found.workspace.root().to_owned();
@@ -458,9 +475,7 @@ impl RepoTask {
     ) -> Result<Handled> {
         let peer = self.hub.peer_name(&announce.peer);
         let id_len = repo.root_operation_id().as_bytes().len();
-        if announce.heads.len() > MAX_ANNOUNCED_HEADS
-            || announce.heads.iter().any(|head| head.len() != id_len)
-        {
+        if announce.heads.iter().any(|head| head.len() != id_len) {
             debug!(%peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }
@@ -576,6 +591,26 @@ impl RepoTask {
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!("git ref repair failed: {err:#}"),
             Err(err) => warn!("git ref repair task failed: {err}"),
+        }
+    }
+
+    /// Reports the repo's git object hash when the mesh records another:
+    /// records written before the hash was gossiped read as SHA-1.
+    fn correct_object_hash(&self, repo: &OpenRepo) {
+        match repo.object_hash() {
+            Ok(object_hash)
+                if self
+                    .recorded_hash
+                    .is_some_and(|recorded| recorded != object_hash) =>
+            {
+                info!(%object_hash, "correcting the object hash the mesh records");
+                let _ = self.updates.send(RepoUpdate::ObjectHash {
+                    repo: self.id.clone(),
+                    object_hash,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => warn!("cannot read the object hash: {err:#}"),
         }
     }
 

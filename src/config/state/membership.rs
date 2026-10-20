@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use super::{RepoId, WorkspaceClaims};
+use super::{ObjectHash, RepoId, WorkspaceClaims};
 
 /// Cap on machines tracked in the mesh state, tombstones included. A
 /// personal mesh is a handful of machines; the cap keeps a peer from
@@ -108,9 +108,14 @@ impl Peer {
     /// tombstone.
     pub fn name(&self) -> Option<&str> {
         match &self.status {
-            PeerStatus::Alive { name } => Some(name),
+            PeerStatus::Alive { name, .. } => Some(name),
             PeerStatus::Removed => None,
         }
+    }
+
+    /// Whether the machine is alive and runs in server mode.
+    pub fn is_server(&self) -> bool {
+        matches!(self.status, PeerStatus::Alive { server: true, .. })
     }
 }
 
@@ -120,13 +125,15 @@ impl Register for Peer {
     }
 
     /// Higher version first, removal beating alive on ties, then the smaller
-    /// name (so equal-version renames converge instead of ping-ponging).
+    /// name and the server role (so equal-version changes converge instead
+    /// of ping-ponging).
     fn outranks(&self, other: &Self) -> bool {
-        fn rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
+        fn rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>, bool) {
             (
                 peer.version,
                 peer.name().is_none(),
                 cmp::Reverse(peer.name().unwrap_or("")),
+                peer.is_server(),
             )
         }
         rank(self) > rank(other)
@@ -137,7 +144,12 @@ impl Register for Peer {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerStatus {
-    Alive { name: String },
+    Alive {
+        name: String,
+        /// Whether it replicates every mesh repo.
+        #[serde(default)]
+        server: bool,
+    },
     Removed,
 }
 
@@ -151,12 +163,18 @@ pub struct MeshRepo {
 }
 
 impl MeshRepo {
-    /// The repo's mesh id while the name is in use; `None` for a tombstone.
-    pub fn id(&self) -> Option<&RepoId> {
+    /// The repo's mesh id and git object hash while the name is in use;
+    /// `None` for a tombstone.
+    pub fn present(&self) -> Option<(&RepoId, ObjectHash)> {
         match &self.status {
-            MeshRepoStatus::Present { id } => Some(id),
+            MeshRepoStatus::Present { id, object_hash } => Some((id, *object_hash)),
             MeshRepoStatus::Removed => None,
         }
+    }
+
+    /// The repo's mesh id while the name is in use; `None` for a tombstone.
+    pub fn id(&self) -> Option<&RepoId> {
+        self.present().map(|(id, _)| id)
     }
 }
 
@@ -166,10 +184,14 @@ impl Register for MeshRepo {
     }
 
     /// Higher version first, removal beating presence on ties, then the
-    /// smaller id.
+    /// smaller id and object hash.
     fn outranks(&self, other: &Self) -> bool {
-        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
-            (repo.version, repo.id().is_none(), cmp::Reverse(repo.id()))
+        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<(&RepoId, ObjectHash)>>) {
+            (
+                repo.version,
+                repo.id().is_none(),
+                cmp::Reverse(repo.present()),
+            )
         }
         rank(self) > rank(other)
     }
@@ -179,6 +201,10 @@ impl Register for MeshRepo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshRepoStatus {
-    Present { id: RepoId },
+    Present {
+        id: RepoId,
+        #[serde(default)]
+        object_hash: ObjectHash,
+    },
     Removed,
 }

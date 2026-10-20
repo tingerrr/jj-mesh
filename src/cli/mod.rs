@@ -5,6 +5,7 @@ mod logs;
 mod peer;
 mod repo;
 mod run_daemon;
+mod server;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod service;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 use color_eyre::eyre::Result;
 
-use crate::config::{ConfigDir, MeshState};
+use crate::config::ConfigDir;
 
 /// Peer-to-peer synchronization of jj repositories
 ///
@@ -34,6 +35,7 @@ use crate::config::{ConfigDir, MeshState};
 ///   4. Clone it on the other machine:    jj-mesh clone <NAME>
 ///
 /// Use `jj-mesh status` to inspect peers, repos, and synchronization status.
+#[allow(rustdoc::bare_urls, rustdoc::invalid_html_tags)]
 #[derive(Debug, Parser)]
 #[command(name = "jj-mesh", version, verbatim_doc_comment)]
 pub struct Cli {
@@ -57,6 +59,7 @@ enum Command {
     Add(repo::AddArgs),
     Repo(repo::RepoArgs),
     Peer(peer::PeerArgs),
+    Server(server::ServerArgs),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Service(service::ServiceArgs),
     Status(status::StatusArgs),
@@ -84,6 +87,7 @@ pub fn run() -> Result<()> {
         Command::Add(args) => repo::add(args, &dir),
         Command::Repo(args) => repo::run(args, &dir),
         Command::Peer(args) => peer::run(args, &dir),
+        Command::Server(args) => server::run(&args, &dir),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(args, &dir),
@@ -102,12 +106,6 @@ pub fn report_error(err: &color_eyre::Report) {
         format!("Error: {err:#}")
     };
     eprintln!("{}", ui::bad(message).for_stderr());
-}
-
-/// This machine's name in the mesh, the default workspace name in synced
-/// repos.
-fn machine_name(dir: &ConfigDir) -> Result<String> {
-    Ok(MeshState::load(dir)?.machine.name)
 }
 
 #[cfg(test)]

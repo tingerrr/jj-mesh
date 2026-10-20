@@ -1,6 +1,6 @@
 //! Test fixtures: runs the `jj` binary against temporary repos, syncs two
-//! local repos over in-memory streams, queries git, and starts settled
-//! filesystem watchers.
+//! local repos over in-memory streams, binds local endpoints, queries git,
+//! and starts settled filesystem watchers.
 //!
 //! Available to this crate's unit tests and, through the `test-util`
 //! feature, to the integration tests.
@@ -17,8 +17,8 @@ use color_eyre::eyre::Result;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub use crate::{net::fetch::GitTransferFormat, repo::transfer::FetchOutcome};
 use crate::{
+    config::ObjectHash,
     net::{
         fetch::{FetchRequest, MAX_OP_FRAME_SIZE},
         wire::read_message,
@@ -28,9 +28,25 @@ use crate::{
         transfer::{FetchOptions, ProgressSink, RepoIdent, fetch, mirror, serve},
     },
 };
+pub use crate::{net::fetch::GitTransferFormat, repo::transfer::FetchOutcome};
 
 /// Network deadline of test fetches, large enough to never fire.
 const NET_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Two endpoints serving `alpn` that dial each other over localhost only.
+pub async fn local_endpoints(alpn: &[u8]) -> [iroh::Endpoint; 2] {
+    let lookup = iroh::address_lookup::MemoryLookup::new();
+    let options = crate::net::EndpointOptions::LocalTest { lookup };
+    let bind = async || {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ConfigDir::new(Some(dir.path().to_owned())).unwrap();
+        let key = crate::config::MachineKey::from_config(&config).unwrap();
+        crate::net::bind_endpoint(&key, vec![alpn.to_vec()], &options)
+            .await
+            .unwrap()
+    };
+    [bind().await, bind().await]
+}
 
 /// A tempdir with a hermetic jj setup: empty jj and git configs, identity
 /// from env.
@@ -87,15 +103,19 @@ impl Fixture {
     /// The hermetic jj invocation shared by all runners.
     fn jj_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(crate::repo::jj_bin());
-        Self::git_env(&mut cmd)
-            .current_dir(dir)
+        self.env(&mut cmd).current_dir(dir).args(args);
+        cmd
+    }
+
+    /// Sets the hermetic jj and git environment on `cmd`, for commands
+    /// running jj themselves.
+    pub fn env<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        Self::git_env(cmd)
             .env("JJ_CONFIG", &self.config)
             .env("JJ_USER", "Test User")
             .env("JJ_EMAIL", "test@example.com")
             .env("JJ_OP_HOSTNAME", "test-host")
             .env("JJ_OP_USERNAME", "test-user")
-            .args(args);
-        cmd
     }
 
     pub fn git_env(cmd: &mut Command) -> &mut Command {
@@ -109,8 +129,17 @@ impl Fixture {
 
     /// Creates a jj repo named `name` with an initial described commit.
     pub fn init_repo(&self, name: &str) -> PathBuf {
+        self.init_repo_hashed(name, ObjectHash::Sha1)
+    }
+
+    /// [`Self::init_repo`] with the git object hash `hash`.
+    pub fn init_repo_hashed(&self, name: &str, hash: ObjectHash) -> PathBuf {
         let dir = self.tmp.path().join(name);
-        self.jj(self.tmp.path(), &["git", "init", name]);
+        let hash = hash.to_string();
+        self.jj(
+            self.tmp.path(),
+            &["git", "init", "--object-hash", &hash, name],
+        );
         self.jj(&dir, &["describe", "-m", "base"]);
         dir
     }
@@ -205,9 +234,7 @@ pub async fn try_sync(
         let request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
             .await
             .unwrap();
-        serve(&server, request, &mut server_tx, &mut server_rx)
-            .await
-            .unwrap();
+        serve(&server, request, &mut server_tx, &mut server_rx).await
     });
 
     let outcome = fetch_from(
@@ -219,7 +246,12 @@ pub async fn try_sync(
         ProgressSink::default(),
     )
     .await;
-    serve_task.await.unwrap();
+    // A failed fetch drops its stream, which ends the serve.
+    drop((client_rx, client_tx));
+    let serve_result = serve_task.await.unwrap();
+    if outcome.is_ok() {
+        serve_result.unwrap();
+    }
     outcome
 }
 

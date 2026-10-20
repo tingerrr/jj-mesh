@@ -124,11 +124,16 @@ workspace. Restart the daemon with `jj-mesh service restart` to apply changes.
 
 ```toml
 [jj-mesh]
-# Interval between automatic snapshots of the working copy, in seconds (0 disables them).
+# Interval between automatic snapshots of the working copy, in seconds or with units like "5m"
+# (0 disables them).
 snapshot-interval = 20
 # Update the working copy after syncing if stale.
 update-stale = true
 ```
+
+`jj-mesh add` and `jj-mesh clone` also take `--snapshot-interval`, written to the repo config (or
+to the new workspace's when the repo already has one here) before the daemon starts watching it:
+`jj-mesh clone <name> --snapshot-interval 0` never watches the files of a huge repo.
 
 ## How it works
 

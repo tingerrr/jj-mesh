@@ -8,12 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Machines can be set in "server mode"** and keep a copy of every mesh repo, without having a
+  workspace for each. Enable it with `jj-mesh setup --server`.
 - **Added `jj-mesh setup` command to setup a new machine** in a single step. It setups the service
   and pairs the machine with the mesh.
 - Recent daemon logs can be viewed with the new `jj-mesh logs` command. Existing logs have been
   made less noisy.
 - New `jj-mesh clone` and `jj-mesh add` top-level aliases for `jj-mesh repo clone` and
   `jj-mesh repo add`. Clone now asks which repo to clone when no name is given.
+- Cloning a repo already on the current machine adds a new workspace to it, so a repo can be cloned
+  several times.
 - The flake now exposes a NixOS module, for systems without Home Manager. `jj-mesh service`
   commands detect the user unit it installs in `/etc/systemd/user` as externally managed.
 
@@ -31,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Peers changes were sometimes rejected after a restart when the local machine did not
   notice the old connection drop (e.g. while suspended).
 - Shallow and partial git clones are now explicitely refused.
+- SHA-256 repos are now supported.
 - The daemon installed on macOS now logs to `~/Library/Logs/jj-mesh.log`.
 
 ## [0.2.0] - 2026-09-06

@@ -3,15 +3,17 @@
 //! ```text
 //! control socket ─┐               ┌─► PeerSet ─ peer tasks ◄──► peer daemons
 //! gossip, claims ─┴─► MeshStore ──┤                │
-//!                     (mesh.json) │             SyncHub
-//!                                 │                │
-//!                                 └─► RepoSet ─ repo tasks ◄──► jj repos
+//!                     (mesh.json) │             SyncHub ─ orphans ───────────┐
+//!                                 │                │                         │
+//!                                 ├─► RepoSet ─ repo tasks ◄──► jj repos     │
+//!                                 └─► Replicas ─ replica task ◄──────────────┘
 //! ```
 //!
 //! `MeshStore` owns the mesh state, and every mutation aligns the `PeerSet`
 //! (one connection task per peer) and the `RepoSet` (one watch task per
-//! repo) with it. Peer and repo tasks never talk directly: the `SyncHub`
-//! routes announcements and fetches between them.
+//! repo) with it, and wakes the replica task of server mode. Peer and repo
+//! tasks never talk directly: the `SyncHub` routes announcements and
+//! fetches between them.
 
 mod backoff;
 pub mod control;
@@ -19,15 +21,16 @@ mod hub;
 mod logs;
 mod pairing;
 mod peers;
+mod replicas;
 mod repos;
 mod store;
 
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, eyre};
 use iroh::Endpoint;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
@@ -38,7 +41,8 @@ use self::{
     hub::SyncHub,
     pairing::Pairing,
     peers::PeerSet,
-    repos::{ClaimUpdate, RepoSet},
+    replicas::Replicas,
+    repos::{RepoSet, RepoUpdate},
     store::MeshStore,
 };
 use crate::{
@@ -69,7 +73,8 @@ const STATUS_DEBOUNCE: Duration = Duration::from_secs(1);
 /// The ALPNs the daemon serves. The pairing ALPN is always among them:
 /// pairing is gated by the one-time ticket, not by ALPN exposure, and
 /// unknown endpoints can complete handshakes on the sync ALPN anyway
-/// (they are refused post-handshake by the peer allowlist).
+/// (they are refused post-handshake by the peer allowlist). Replaced ALPNs
+/// stay served with their hello alone (see [`crate::net::hello`]).
 fn alpns() -> Vec<Vec<u8>> {
     vec![sync::ALPN.to_vec(), pair::ALPN.to_vec()]
 }
@@ -123,14 +128,16 @@ impl Daemon {
             hub.clone(),
             gossip_tx,
         ));
-        let (claim_tx, claim_rx) = mpsc::unbounded_channel();
-        let repos = Arc::new(RepoSet::new(hub.clone(), claim_tx));
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        let repos = Arc::new(RepoSet::new(hub.clone(), update_tx));
+        let replicas = Arc::new(Replicas::default());
         let store = Arc::new(MeshStore::new(
             dir.clone(),
             key.endpoint_id(),
             state,
             peers.clone(),
             repos.clone(),
+            replicas.clone(),
             hub.clone(),
         ));
         let pairing = Arc::new(Pairing::new(
@@ -153,7 +160,13 @@ impl Daemon {
 
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
-        tasks.spawn(claim_loop(claim_rx, store.clone()));
+        tasks.spawn(update_loop(update_rx, store.clone()));
+        tasks.spawn(replicas::run(
+            dir.clone(),
+            store.clone(),
+            hub.clone(),
+            replicas,
+        ));
         tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(gossip_loop(store));
 
@@ -218,9 +231,9 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
         let pairing = pairing.clone();
         tokio::spawn(async move {
             // The permit is captured by the task and released when it
-            // ends, covering the whole handshake.
+            // ends, covering the whole handshake (and the sync hello).
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
-                Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn),
+                Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn).await,
                 Ok(Ok(conn)) if conn.alpn() == pair::ALPN => {
                     // The exchange outlives the handshake phase; release
                     // the permit and let pairing bound its own work.
@@ -267,14 +280,25 @@ async fn membership_loop(mut gossip: mpsc::Receiver<(String, Membership)>, store
     }
 }
 
-/// Persists the workspace claims repo tasks make; the store then gossips
-/// them and feeds them back to the repo tasks.
-async fn claim_loop(mut claims: mpsc::UnboundedReceiver<ClaimUpdate>, store: Arc<MeshStore>) {
-    while let Some(ClaimUpdate { repo, names }) = claims.recv().await {
-        if let Err(err) = store.update(|state| state.set_claims(&repo, names)) {
+/// Persists the changes repo tasks make (workspace claims, object hash
+/// corrections); the store then gossips them and feeds the claims back to
+/// the repo tasks.
+async fn update_loop(mut updates: mpsc::UnboundedReceiver<RepoUpdate>, store: Arc<MeshStore>) {
+    while let Some(update) = updates.recv().await {
+        let (repo, result) = match update {
+            RepoUpdate::Claims { repo, names } => {
+                let result = store.update(|state| state.set_claims(&repo, names));
+                (repo, result.wrap_err("cannot claim workspaces"))
+            }
+            RepoUpdate::ObjectHash { repo, object_hash } => {
+                let result = store.update(|state| state.set_object_hash(&repo, object_hash));
+                (repo, result.wrap_err("cannot record the object hash"))
+            }
+        };
+        if let Err(err) = result {
             let snapshot = store.snapshot();
             let repo = snapshot.repo_name(&repo).unwrap_or("(removed)");
-            warn!(%repo, "cannot claim workspaces: {err:#}");
+            warn!(%repo, "{err:#}");
         }
     }
 }
@@ -286,6 +310,15 @@ async fn gossip_loop(store: Arc<MeshStore>) {
     loop {
         tokio::time::sleep(GOSSIP_INTERVAL).await;
         store.republish_membership();
+    }
+}
+
+/// Sleeps until `deadline`, or never when it is `None`, so an optional
+/// deadline can sit in a `select!` uniformly.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
     }
 }
 
